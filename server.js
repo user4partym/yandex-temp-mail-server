@@ -6,9 +6,14 @@
 // Sab mail us provider ke inbox me aati hai. Server har mail ke To header se +tag
 // nikal kar us tag wale visitor ko dikhata hai. Mail kabhi delete nahi karni,
 // sirf read karna hai.
+// ADMIN: Admin Login (app password se) + email pool — admin panel se base email
+// badlo ya pool me multiple accounts rakho; naya temp mail pool se RANDOM account
+// par banta hai (pool khali ho to default base). Pool/data.json Render free par
+// restart par kho sakta hai — durable setup env vars se aata hai.
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { ImapFlow } = require('imapflow');
@@ -49,7 +54,7 @@ function msgKey(provider, tag) {
 //   Yandex: YANDEX_BASE_EMAIL / YANDEX_APP_PASSWORD
 //   Gmail:  GMAIL_BASE_EMAIL / GMAIL_APP_PASSWORD
 // Password kabhi kisi response me wapas nahi bhejna.
-let data = { setup: null, aliases: [], messages: {}, seen: [] };
+let data = { setup: null, aliases: [], messages: {}, seen: [], pool: [] };
 
 function loadData() {
   try {
@@ -60,6 +65,7 @@ function loadData() {
         data.aliases = Array.isArray(raw.aliases) ? raw.aliases : [];
         data.messages = raw.messages && typeof raw.messages === 'object' ? raw.messages : {};
         data.seen = Array.isArray(raw.seen) ? raw.seen : [];
+        data.pool = Array.isArray(raw.pool) ? raw.pool : [];
       }
     }
   } catch (e) {
@@ -121,6 +127,79 @@ function isConfigured(provider) {
   return !!(s && s.baseEmail && s.appPassword);
 }
 
+// ---------- Admin login + email pool ----------
+// Admin login = Yandex ya Gmail ka app password (jo setup me save hai).
+// Koi alag admin password file/code me nahi — sirf wohi login kar sakta hai
+// jis ke paas app password hai. Login par random token milta hai (sirf
+// server memory me rehta hai; restart par logout ho jata hai).
+const adminTokens = new Set();
+let loginFailCount = 0;
+let loginLockUntil = 0;
+
+function hashPw(pw) { return crypto.createHash('sha256').update(String(pw || '')).digest(); }
+
+function adminPasswordMatches(pw) {
+  if (!pw) return false;
+  const h = hashPw(pw);
+  for (const p of ['yandex', 'gmail']) {
+    const s = effectiveSetup(p);
+    if (s && s.appPassword && crypto.timingSafeEqual(h, hashPw(s.appPassword))) return true;
+  }
+  return false;
+}
+
+function adminTokenFrom(req) {
+  const h = String(req.headers.authorization || '');
+  return h.startsWith('Bearer ') ? h.slice(7) : '';
+}
+
+function requireAdmin(req, res, next) {
+  const token = adminTokenFrom(req);
+  if (token && adminTokens.has(token)) return next();
+  return res.status(401).json({ error: 'Admin login required — pehle Admin Login karo' });
+}
+
+// Setup badalna sirf admin kar sakta hai — jab koi provider configured ho.
+// Bilkul pehli setup (kuch configured nahi) khuli rehti hai.
+function requireAdminIfConfigured(req, res, next) {
+  if (isConfigured('yandex') || isConfigured('gmail')) return requireAdmin(req, res, next);
+  return next();
+}
+
+// Pool: admin ke diye hue extra accounts (provider + baseEmail + appPassword).
+// Naya temp mail pool se RANDOM account par banta hai.
+function poolFor(provider) {
+  return (data.pool || []).filter((e) => e.provider === normProvider(provider));
+}
+
+function pickAccount(provider) {
+  const p = normProvider(provider);
+  const entries = poolFor(p);
+  if (entries.length) {
+    const e = entries[Math.floor(Math.random() * entries.length)];
+    return { baseEmail: e.baseEmail, appPassword: e.appPassword, poolId: e.id };
+  }
+  const s = effectiveSetup(p);
+  return s ? { baseEmail: s.baseEmail, appPassword: s.appPassword, poolId: null } : null;
+}
+
+// Sync ke liye account: alias ka snapshot pehle (pool account), phir default setup.
+function resolveAccount(provider, tag) {
+  const p = normProvider(provider);
+  const alias = data.aliases.find((a) => a.tag === String(tag || '').trim().toLowerCase() && (a.provider || 'yandex') === p);
+  if (alias && alias.account && alias.account.baseEmail && alias.account.appPassword) {
+    return { baseEmail: alias.account.baseEmail, appPassword: alias.account.appPassword, poolId: alias.account.poolId || null };
+  }
+  const s = effectiveSetup(p);
+  return s ? { baseEmail: s.baseEmail, appPassword: s.appPassword, poolId: null } : null;
+}
+
+// Alias client ko bhejte waqt account (password) kabhi nahi bhejna.
+function publicAlias(a) {
+  if (!a) return a;
+  return { address: a.address, tag: a.tag, code: a.code, expiresAt: a.expiresAt, createdAt: a.createdAt, provider: a.provider, restored: !!a.restored, poolId: a.poolId || null };
+}
+
 function publicSetup() {
   const y = effectiveSetup('yandex');
   const g = effectiveSetup('gmail');
@@ -170,8 +249,8 @@ app.get('/api/setup', (req, res) => {
   res.json(publicSetup());
 });
 
-// POST /api/setup {provider, baseEmail, appPassword} -> save karo
-app.post('/api/setup', (req, res) => {
+// POST /api/setup {provider, baseEmail, appPassword} -> save karo (admin only, jab configured ho)
+app.post('/api/setup', requireAdminIfConfigured, (req, res) => {
   const provider = normProvider(req.body && req.body.provider);
   const domain = '@' + PROVIDERS[provider].domain;
   const baseEmail = String(req.body && req.body.baseEmail ? req.body.baseEmail : '').trim().toLowerCase();
@@ -192,26 +271,27 @@ app.post('/api/setup', (req, res) => {
   res.json({ ...publicSetup(), provider });
 });
 
-// POST /api/alias {provider} -> naya random 6-char tag, 60-min expiry
+// POST /api/alias {provider} -> naya random 6-char tag, 60-min expiry.
+// Pool me us provider ke accounts hon to RANDOM account par banta hai.
 app.post('/api/alias', (req, res) => {
   const provider = normProvider((req.body && req.body.provider) || (req.query && req.query.provider));
-  if (!isConfigured(provider)) {
+  const account = pickAccount(provider);
+  if (!account) {
     return res.status(400).json({ error: provider === 'gmail' ? 'Pehle Gmail setup karo (base email + app password)' : 'Pehle Setup me apna Yandex base email dalo' });
   }
   pruneExpired();
   let tag = randomTag();
   const used = new Set(data.aliases.filter((a) => (a.provider || 'yandex') === provider).map((a) => a.tag));
   while (used.has(tag)) tag = randomTag();
-  const base = effectiveSetup(provider).baseEmail;
-  const local = base.split('@')[0];
+  const local = account.baseEmail.split('@')[0];
   const address = `${local}+${tag}@${PROVIDERS[provider].domain}`;
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-  const alias = { address, tag, code: tag, expiresAt, createdAt: new Date().toISOString(), provider };
+  const alias = { address, tag, code: tag, expiresAt, createdAt: new Date().toISOString(), provider, poolId: account.poolId, account: { baseEmail: account.baseEmail, appPassword: account.appPassword, poolId: account.poolId } };
   data.aliases.push(alias);
   const key = msgKey(provider, tag);
   if (!data.messages[key]) data.messages[key] = [];
   saveData();
-  res.json(alias);
+  res.json(publicAlias(alias));
 });
 
 // GET /api/alias/:code?provider=gmail -> alias dhoondo; na mile to code se dobara banao.
@@ -235,6 +315,8 @@ app.get('/api/alias/:code', (req, res) => {
       createdAt: new Date().toISOString(),
       provider,
       restored: true,
+      poolId: null,
+      account: { baseEmail: effectiveSetup(provider).baseEmail, appPassword: effectiveSetup(provider).appPassword, poolId: null },
     };
     data.aliases.push(alias);
     const key = msgKey(provider, code);
@@ -244,7 +326,7 @@ app.get('/api/alias/:code', (req, res) => {
   if (!alias) {
     return res.status(404).json({ error: 'Is code par koi address nahi mila' });
   }
-  res.json(alias);
+  res.json(publicAlias(alias));
 });
 
 // Spam folder dhoondo — provider kabhi kabhi mail ko Spam me daal deta hai.
@@ -280,11 +362,12 @@ app.post('/api/sync', async (req, res) => {
   const key = msgKey(provider, tag);
   const totalForTag = () => (data.messages[key] ? data.messages[key].length : 0);
 
-  if (!isConfigured(provider)) {
+  const account = resolveAccount(provider, tag);
+  if (!account) {
     return res.json({ status: 'no_credentials', newCount: 0, total: totalForTag(), error: provider === 'gmail' ? 'Pehle Gmail setup karo (base email + app password)' : 'Pehle Setup me apna Yandex base email aur app password dalo' });
   }
 
-  const setup = effectiveSetup(provider);
+  const setup = account;
   const client = new ImapFlow({
     host: PROVIDERS[provider].host,
     port: 993,
@@ -399,6 +482,73 @@ app.get('/api/message/:tag/:id', (req, res) => {
   msg.read = true;
   saveData();
   res.json(msg);
+});
+
+// ---------- Admin login + email pool ----------
+// POST /api/admin/login {password} -> app password sahi ho to token do.
+// 5 ghalat koshishon par 5 minute ka lock.
+app.post('/api/admin/login', (req, res) => {
+  const now = Date.now();
+  if (now < loginLockUntil) {
+    return res.status(429).json({ error: 'Bohat dafa ghalat password — 5 minute baad dobara try karo' });
+  }
+  const pw = String((req.body && req.body.password) || '');
+  if (!pw) return res.status(400).json({ error: 'Password dalo' });
+  if (!adminPasswordMatches(pw)) {
+    loginFailCount++;
+    if (loginFailCount >= 5) { loginLockUntil = now + 5 * 60 * 1000; loginFailCount = 0; }
+    return res.status(401).json({ error: 'Ghalat password' });
+  }
+  loginFailCount = 0;
+  const token = crypto.randomBytes(32).toString('hex');
+  adminTokens.add(token);
+  res.json({ ok: true, token });
+});
+
+// GET /api/admin/status -> token sahi hai ya nahi
+app.get('/api/admin/status', (req, res) => {
+  const token = adminTokenFrom(req);
+  res.json({ loggedIn: !!(token && adminTokens.has(token)) });
+});
+
+// Pool list (password kabhi nahi bhejni)
+function publicPool() {
+  return (data.pool || []).map((e) => ({ id: e.id, provider: e.provider, baseEmail: e.baseEmail, createdAt: e.createdAt }));
+}
+
+// GET /api/admin/pool -> list dikhao
+app.get('/api/admin/pool', requireAdmin, (req, res) => {
+  res.json({ pool: publicPool() });
+});
+
+// POST /api/admin/pool {provider, baseEmail, appPassword} -> list me add karo
+app.post('/api/admin/pool', requireAdmin, (req, res) => {
+  const provider = normProvider(req.body && req.body.provider);
+  const domain = '@' + PROVIDERS[provider].domain;
+  const baseEmail = String(req.body && req.body.baseEmail ? req.body.baseEmail : '').trim().toLowerCase();
+  const appPassword = String(req.body && req.body.appPassword ? req.body.appPassword : '').trim();
+  if (!baseEmail || !baseEmail.includes('@') || !baseEmail.endsWith(domain)) {
+    return res.status(400).json({ error: `Sahi ${provider === 'gmail' ? 'Gmail' : 'Yandex'} email dalo` });
+  }
+  if (!appPassword) return res.status(400).json({ error: 'App password dalo — us email ka inbox parhne ke liye chahiye' });
+  if (!Array.isArray(data.pool)) data.pool = [];
+  const existing = data.pool.find((e) => e.provider === provider && e.baseEmail === baseEmail);
+  if (existing) {
+    existing.appPassword = appPassword;
+  } else {
+    if (data.pool.length >= 20) return res.status(400).json({ error: 'List me zyada se zyada 20 emails rakh sakte ho' });
+    data.pool.push({ id: crypto.randomBytes(6).toString('hex'), provider, baseEmail, appPassword, createdAt: new Date().toISOString() });
+  }
+  saveData();
+  res.json({ ok: true, pool: publicPool() });
+});
+
+// DELETE /api/admin/pool/:id -> list se hatao
+app.delete('/api/admin/pool/:id', requireAdmin, (req, res) => {
+  const id = String(req.params.id || '');
+  data.pool = (data.pool || []).filter((e) => e.id !== id);
+  saveData();
+  res.json({ ok: true, pool: publicPool() });
 });
 
 // 404 for unknown API routes
