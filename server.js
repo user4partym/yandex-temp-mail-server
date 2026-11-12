@@ -54,7 +54,7 @@ function msgKey(provider, tag) {
 //   Yandex: YANDEX_BASE_EMAIL / YANDEX_APP_PASSWORD
 //   Gmail:  GMAIL_BASE_EMAIL / GMAIL_APP_PASSWORD
 // Password kabhi kisi response me wapas nahi bhejna.
-let data = { setup: null, aliases: [], messages: {}, seen: [], pool: [], rotation: {} };
+let data = { setup: null, aliases: [], messages: {}, seen: [], pool: [], fbCount: {}, fbSeenTags: {} };
 
 function loadData() {
   try {
@@ -66,7 +66,8 @@ function loadData() {
         data.messages = raw.messages && typeof raw.messages === 'object' ? raw.messages : {};
         data.seen = Array.isArray(raw.seen) ? raw.seen : [];
         data.pool = Array.isArray(raw.pool) ? raw.pool : [];
-        data.rotation = raw.rotation && typeof raw.rotation === 'object' ? raw.rotation : {};
+        data.fbCount = raw.fbCount && typeof raw.fbCount === 'object' ? raw.fbCount : {};
+        data.fbSeenTags = raw.fbSeenTags && typeof raw.fbSeenTags === 'object' ? raw.fbSeenTags : {};
       }
     }
   } catch (e) {
@@ -186,41 +187,63 @@ function poolFor(provider) {
   return (data.pool || []).filter((e) => e.provider === normProvider(provider));
 }
 
-// ---------- Auto-rotation: ek email par 3 naye temp mail, phir agli email ----------
-// Facebook IDs ke liye: ek base email par 3 IDs bante hain, phir list ki agli
-// email khud use hone lagti hai. Gin ti POST /api/alias (New Email) par hoti
-// hai — restore (purana code dobara kholna) gin ti me nahi aata. State
-// data.json me rehti hai (Render restart/deploy par reset ho sakti hai —
-// phir pehli email se dobara shuru hoti hai).
-const ROTATION_LIMIT = 3;
+// ---------- Facebook registration gin ti + random pick ----------
+// Har naya temp mail list (pool) ki emails me se RANDOM ek par banta hai —
+// koi sequential 3-3-3 rotation nahi, koi cap nahi (mail unlimited bante
+// hain). Gin ti Facebook ke registration notification (code mail) se hoti
+// hai: jab kisi tag par Facebook ka code mail sync ho kar aata hai to us
+// tag par 1 Facebook ID ban gaya. Jis base email par 3 ho jayen, wo email
+// naye temp mail ke liye side par ho jati hai — random pick sirf baaqi
+// (eligible) emails me se hota hai. Sab par 3 ho jayen to phir bhi random
+// chalta hai (mail kabhi rukti nahi). Gin ti data.json me rehti hai
+// (Render restart/deploy par reset ho sakti hai).
+const FB_LIMIT = 3;
 
-function rotationState(provider) {
-  const p = normProvider(provider);
-  if (!data.rotation || typeof data.rotation !== 'object') data.rotation = {};
-  if (!data.rotation[p] || typeof data.rotation[p] !== 'object') data.rotation[p] = { index: 0, used: 0 };
-  return data.rotation[p];
+function fbCountKey(provider, baseEmail) {
+  return normProvider(provider) + '|' + String(baseEmail || '').trim().toLowerCase();
+}
+function fbCountFor(provider, baseEmail) {
+  if (!data.fbCount || typeof data.fbCount !== 'object') data.fbCount = {};
+  return data.fbCount[fbCountKey(provider, baseEmail)] || 0;
+}
+function isFacebookRegistration(item) {
+  const from = String(item.from || '').toLowerCase();
+  const subj = String(item.subject || '').toLowerCase();
+  const isFbSender = from.includes('facebookmail.com') || from.includes('@facebook.com');
+  if (!isFbSender) return false;
+  return subj.includes('confirm') || subj.includes('code') || !!item.otp;
+}
+function countFacebookRegistration(item, msgTag, provider) {
+  if (!isFacebookRegistration(item)) return;
+  if (!data.fbSeenTags || typeof data.fbSeenTags !== 'object') data.fbSeenTags = {};
+  const seenKey = normProvider(provider) + ':' + String(msgTag || '').trim().toLowerCase();
+  if (data.fbSeenTags[seenKey]) return; // is tag ki gin ti ho chuki
+  const toAddr = String(item.to || '');
+  const local = toAddr.split('@')[0].split('+')[0];
+  if (!local) return;
+  const baseEmail = local + '@' + PROVIDERS[normProvider(provider)].domain;
+  data.fbSeenTags[seenKey] = true;
+  if (!data.fbCount || typeof data.fbCount !== 'object') data.fbCount = {};
+  const k = fbCountKey(provider, baseEmail);
+  data.fbCount[k] = (data.fbCount[k] || 0) + 1;
+  saveData();
 }
 
-// Admin panel + alias response ke liye: abhi kaun si email chal rahi hai,
-// us par kitne ban chuke, list me kitni bachi hain. Password kabhi nahi.
-function rotationStatus(provider) {
+// Admin panel + alias response ke liye: list me kitni emails hain, kitni
+// eligible bachi hain (jin par 3 Facebook IDs abhi nahi bane). Password kabhi nahi.
+function poolInfo(provider) {
   const p = normProvider(provider);
   const entries = poolFor(p);
   if (!entries.length) {
     const s = effectiveSetup(p);
-    return { active: s ? s.baseEmail : null, used: 0, limit: ROTATION_LIMIT, remaining: 0, total: 0, poolEmpty: true };
+    return { size: 0, eligible: 0, poolEmpty: true, active: s ? s.baseEmail : null };
   }
-  const st = rotationState(p);
-  const idx = Math.max(0, Math.min(st.index, entries.length - 1));
-  st.index = idx;
-  const used = Math.max(0, Math.min(st.used, ROTATION_LIMIT));
+  const eligibleEntries = entries.filter((e) => fbCountFor(p, e.baseEmail) < FB_LIMIT);
   return {
-    active: entries[idx].baseEmail,
-    used,
-    limit: ROTATION_LIMIT,
-    remaining: entries.length - 1 - idx,
-    total: entries.length,
+    size: entries.length,
+    eligible: eligibleEntries.length,
     poolEmpty: false,
+    active: eligibleEntries.length === 1 ? eligibleEntries[0].baseEmail : null,
   };
 }
 
@@ -228,18 +251,10 @@ function pickAccount(provider) {
   const p = normProvider(provider);
   const entries = poolFor(p);
   if (entries.length) {
-    const st = rotationState(p);
-    // Index hamesha list ke andar rakho (entry delete hone par clamp).
-    if (st.index >= entries.length) { st.index = entries.length - 1; st.used = 0; }
-    if (st.index < 0) st.index = 0;
-    // 3 poore ho gaye aur agli email hai to rotate karo.
-    if (st.used >= ROTATION_LIMIT && st.index < entries.length - 1) {
-      st.index += 1;
-      st.used = 0;
-    }
-    const e = entries[st.index];
-    st.used += 1; // is email par ek aur naya temp mail ban gaya
-    saveData();
+    // Pehle wo emails jin par 3 Facebook IDs abhi nahi bane (eligible).
+    let eligible = entries.filter((e) => fbCountFor(p, e.baseEmail) < FB_LIMIT);
+    if (!eligible.length) eligible = entries; // sab par 3 ho gaye — phir bhi random (mail rukti nahi)
+    const e = eligible[Math.floor(Math.random() * eligible.length)];
     return { baseEmail: e.baseEmail, appPassword: e.appPassword, poolId: e.id };
   }
   const s = effectiveSetup(p);
@@ -354,7 +369,7 @@ app.post('/api/alias', (req, res) => {
   const key = msgKey(provider, tag);
   if (!data.messages[key]) data.messages[key] = [];
   saveData();
-  res.json({ ...publicAlias(alias), rotation: rotationStatus(provider) });
+  res.json({ ...publicAlias(alias), poolInfo: poolInfo(provider) });
 });
 
 // GET /api/alias/:code?provider=gmail -> alias dhoondo; na mile to code se dobara banao.
@@ -493,6 +508,8 @@ app.post('/api/sync', async (req, res) => {
         data.messages[storeKey].sort((a, b) => new Date(b.date) - new Date(a.date));
         seenSet.add(dedupeKey);
         data.seen.push(dedupeKey);
+        // Facebook registration mail? Is tag par 1 Facebook ID ban gaya.
+        countFacebookRegistration(item, msgTag, provider);
         if (msgTag === tag) count++;
       } catch (e) {
         console.log('Ek mail parse nahi hui, skip:', e.message);
@@ -574,14 +591,14 @@ app.get('/api/admin/status', (req, res) => {
   res.json({ loggedIn: !!(token && adminTokens.has(token)) });
 });
 
-// Pool list (password kabhi nahi bhejni)
+// Pool list (password kabhi nahi bhejni; FB gin ti sirf dikhane ke liye)
 function publicPool() {
-  return (data.pool || []).map((e) => ({ id: e.id, provider: e.provider, baseEmail: e.baseEmail, createdAt: e.createdAt }));
+  return (data.pool || []).map((e) => ({ id: e.id, provider: e.provider, baseEmail: e.baseEmail, createdAt: e.createdAt, fb: fbCountFor(e.provider, e.baseEmail) }));
 }
 
-// GET /api/admin/pool -> list dikhao (rotation status ke saath)
+// GET /api/admin/pool -> list dikhao (pool info ke saath)
 app.get('/api/admin/pool', requireAdmin, (req, res) => {
-  res.json({ pool: publicPool(), rotation: { yandex: rotationStatus('yandex'), gmail: rotationStatus('gmail') } });
+  res.json({ pool: publicPool(), poolInfo: { yandex: poolInfo('yandex'), gmail: poolInfo('gmail') } });
 });
 
 // POST /api/admin/pool {provider, baseEmail, appPassword} -> list me add karo
@@ -603,25 +620,15 @@ app.post('/api/admin/pool', requireAdmin, (req, res) => {
     data.pool.push({ id: crypto.randomBytes(6).toString('hex'), provider, baseEmail, appPassword, createdAt: new Date().toISOString() });
   }
   saveData();
-  res.json({ ok: true, pool: publicPool(), rotation: { yandex: rotationStatus('yandex'), gmail: rotationStatus('gmail') } });
+  res.json({ ok: true, pool: publicPool(), poolInfo: { yandex: poolInfo('yandex'), gmail: poolInfo('gmail') } });
 });
 
 // DELETE /api/admin/pool/:id -> list se hatao
 app.delete('/api/admin/pool/:id', requireAdmin, (req, res) => {
   const id = String(req.params.id || '');
-  const list = data.pool || [];
-  const idx = list.findIndex((e) => e.id === id);
-  if (idx >= 0) {
-    // Rotation adjust karo: current entry delete hui to us ki gin ti reset;
-    // us se pehle wali delete hui to index ek peeche.
-    const st = rotationState(list[idx].provider);
-    if (idx < st.index) st.index -= 1;
-    else if (idx === st.index) st.used = 0;
-    if (st.index < 0) st.index = 0;
-  }
-  data.pool = list.filter((e) => e.id !== id);
+  data.pool = (data.pool || []).filter((e) => e.id !== id);
   saveData();
-  res.json({ ok: true, pool: publicPool(), rotation: { yandex: rotationStatus('yandex'), gmail: rotationStatus('gmail') } });
+  res.json({ ok: true, pool: publicPool(), poolInfo: { yandex: poolInfo('yandex'), gmail: poolInfo('gmail') } });
 });
 
 // 404 for unknown API routes
@@ -629,7 +636,12 @@ app.use('/api', (req, res) => {
   res.status(404).json({ error: 'Ye endpoint nahi hai' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Temp Mail server chal raha hai, port ${PORT}`);
-  console.log(`Setup — Yandex: ${isConfigured('yandex')}${ENV_SETUP ? ' (env vars se)' : ''}, Gmail: ${isConfigured('gmail')}${GMAIL_ENV_SETUP ? ' (env vars se)' : ''}`);
-});
+// Sirf seedha chalane par suno; require karne par (tests) sirf helpers do.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Temp Mail server chal raha hai, port ${PORT}`);
+    console.log(`Setup — Yandex: ${isConfigured('yandex')}${ENV_SETUP ? ' (env vars se)' : ''}, Gmail: ${isConfigured('gmail')}${GMAIL_ENV_SETUP ? ' (env vars se)' : ''}`);
+  });
+} else {
+  module.exports = { app, getData: () => data, isFacebookRegistration, countFacebookRegistration, fbCountFor, poolInfo, pickAccount };
+}
