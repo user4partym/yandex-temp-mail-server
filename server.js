@@ -209,9 +209,11 @@ function fbCountFor(provider, baseEmail) {
 function isFacebookRegistration(item) {
   const from = String(item.from || '').toLowerCase();
   const subj = String(item.subject || '').toLowerCase();
-  const isFbSender = from.includes('facebookmail.com') || from.includes('@facebook.com');
-  if (!isFbSender) return false;
-  return subj.includes('confirm') || subj.includes('code') || !!item.otp;
+  // SIRF registration wali mail gino — code se nahi: forgot-password ka code
+  // bhi aa sakta hai. Registration code hamesha registration@facebookmail.com
+  // se aata hai aur subject me "confirmation code" hota hai.
+  if (!from.includes('registration@facebookmail.com')) return false;
+  return subj.includes('confirmation code') || subj.includes('confirm');
 }
 function countFacebookRegistration(item, msgTag, provider) {
   if (!isFacebookRegistration(item)) return;
