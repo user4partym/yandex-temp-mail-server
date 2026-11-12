@@ -141,6 +141,9 @@ function hashPw(pw) { return crypto.createHash('sha256').update(String(pw || '')
 function adminPasswordMatches(pw) {
   if (!pw) return false;
   const h = hashPw(pw);
+  // Dedicated admin password (Render env ADMIN_PASSWORD) — app passwords ke ilawa bhi chalega.
+  const adminPw = String(process.env.ADMIN_PASSWORD || '').trim();
+  if (adminPw && crypto.timingSafeEqual(h, hashPw(adminPw))) return true;
   for (const p of ['yandex', 'gmail']) {
     const s = effectiveSetup(p);
     if (s && s.appPassword && crypto.timingSafeEqual(h, hashPw(s.appPassword))) return true;
@@ -485,7 +488,7 @@ app.get('/api/message/:tag/:id', (req, res) => {
 });
 
 // ---------- Admin login + email pool ----------
-// POST /api/admin/login {password} -> app password sahi ho to token do.
+// POST /api/admin/login {password} -> admin password (ya app password) sahi ho to token do.
 // 5 ghalat koshishon par 5 minute ka lock.
 app.post('/api/admin/login', (req, res) => {
   const now = Date.now();
