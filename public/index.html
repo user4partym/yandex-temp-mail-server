@@ -251,6 +251,25 @@
     fireNotification(m);
     logNotification(m);
   }
+
+  /* ---------- rotation warning: list khatam hone wali ho to khabar do ---------- */
+  var ROTATION_WARN_KEY = "temp-mail-rotation-warned";
+  function checkRotationWarning(r, prov) {
+    if (!r || r.poolEmpty || typeof r.remaining !== "number") return;
+    if (r.remaining > 1) return; // sirf 1 bachi ho ya aakhri chal rahi ho to warn karo
+    var key = prov + ":" + (r.active || "") + ":" + r.remaining;
+    var warned = "";
+    try { warned = window.localStorage.getItem(ROTATION_WARN_KEY) || ""; } catch (e) {}
+    if (warned === key) return; // is haalat ki warning ek dafa hi
+    try { window.localStorage.setItem(ROTATION_WARN_KEY, key); } catch (e) {}
+    var msg = r.remaining === 1
+      ? "Sirf 1 email bachi hai list me — " + (r.active || "") + " ke baad aakhri email aayegi. Nayi emails list me add karo."
+      : "Aakhri email chal rahi hai (" + (r.active || "") + ") — list khatam hone wali hai! Nayi emails add karo.";
+    logNotification({ from: "⚠️ Email list", subject: msg });
+    if (S.notifyOn && notifySupported() && Notification.permission === "granted") {
+      try { new Notification("⚠️ Temp Mail — emails khatam hone wali hain", { body: msg, tag: "tempmail-rotation" }); } catch (e) {}
+    }
+  }
   function enableNotifications() {
     if (!notifySupported()) { S.notifyOn = true; saveNotifyPref(true); updateNotifyBtn(); renderNotifyLog(); return; }
     if (Notification.permission === "granted") {
@@ -307,13 +326,28 @@
     if (!S.adminLoggedIn) { S.pool = []; return Promise.resolve([]); }
     return api("/api/admin/pool", { headers: adminHeaders() }).then(function (res) {
       S.pool = (res.data && res.data.pool) ? res.data.pool : [];
+      if (res.data && res.data.rotation) S.rotation = res.data.rotation;
       renderPool();
       return S.pool;
     }, function () { return []; });
   }
+  function rotationLine(r, provName) {
+    if (!r) return "";
+    if (r.poolEmpty) return '<div class="small dim">' + provName + ': list khaali hai — default base email use ho raha hai.</div>';
+    var left = r.remaining === 0 ? "koi email nahi bachi — nayi add karo" : r.remaining === 1 ? "sirf 1 email bachi hai" : r.remaining + " emails bachi hain";
+    var warn = r.remaining <= 1 ? ' style="color:var(--accent);font-weight:700"' : "";
+    return '<div class="small"' + warn + '>' + provName + ': abhi <strong>' + esc(r.active || "") + "</strong> chal rahi hai (" + r.used + "/" + r.limit + " use) — list me " + left + ".</div>";
+  }
   function renderPool() {
     var list = el("pool-list");
     if (!list) return;
+    var rs = el("rotation-status");
+    if (rs) {
+      var rot = S.rotation || null;
+      var rh = "";
+      if (rot) { rh += rotationLine(rot.yandex, "Yandex"); rh += rotationLine(rot.gmail, "Gmail"); }
+      rs.innerHTML = rh;
+    }
     var html = "";
     if (!S.pool.length) html = '<li class="dim">List khaali hai — neeche se email add karo.</li>';
     S.pool.forEach(function (e) {
@@ -325,7 +359,7 @@
       b.addEventListener("click", function () {
         var id = b.getAttribute("data-id");
         api("/api/admin/pool/" + encodeURIComponent(id), { method: "DELETE", headers: adminHeaders() }).then(function (res) {
-          if (res.status === 200 && res.data && res.data.pool) { S.pool = res.data.pool; renderPool(); }
+          if (res.status === 200 && res.data && res.data.pool) { S.pool = res.data.pool; if (res.data.rotation) S.rotation = res.data.rotation; renderPool(); }
         });
       });
     });
@@ -390,8 +424,9 @@
     poolSec.className = "card card-sm section-card";
     poolSec.id = "pool-section";
     poolSec.innerHTML =
-      '<h2>📧 Email List (random)</h2>' +
-      '<p class="small dim" style="margin:.25rem 0 0">List me jo emails hongi, har naya temp mail un me se <strong>random</strong> ek par banega. Har email ke saath us ka app password dena zaroori hai (warna us ka inbox parha nahi ja sakega). List khaali ho to default base email use hota hai.</p>' +
+      '<h2>📧 Email List</h2>' +
+      '<p class="small dim" style="margin:.25rem 0 0">List ki pehli email par 3 naye temp mail bante hain, phir khud agli email par chala jata hai. Har email ke saath us ka app password dena zaroori hai (warna us ka inbox parha nahi ja sakega). List khaali ho to default base email use hota hai.</p>' +
+      '<div id="rotation-status" style="margin:.5rem 0 0"></div>' +
       '<ul id="pool-list" class="notify-list"></ul>' +
       '<form id="pool-form" style="margin-top:.75rem">' +
       '<label class="field-label" for="pool-provider">Mail provider</label>' +
@@ -420,6 +455,7 @@
           return;
         }
         S.pool = res.data.pool;
+        if (res.data.rotation) S.rotation = res.data.rotation;
         el("pool-email").value = "";
         el("pool-password").value = "";
         renderPool();
@@ -865,6 +901,7 @@
     var prov = S.provider;
     api("/api/alias", { method: "POST", body: JSON.stringify({ provider: prov }) }).then(function (res) {
       if (res.status !== 200) throw new Error(errText(res.data, "Could not create a new address, please try again."));
+      if (res.data && res.data.rotation) checkRotationWarning(res.data.rotation, prov);
       return normAlias(res.data);
     }).then(function (a) {
       S.creating = false;
