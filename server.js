@@ -54,7 +54,7 @@ function msgKey(provider, tag) {
 //   Yandex: YANDEX_BASE_EMAIL / YANDEX_APP_PASSWORD
 //   Gmail:  GMAIL_BASE_EMAIL / GMAIL_APP_PASSWORD
 // Password kabhi kisi response me wapas nahi bhejna.
-let data = { setup: null, aliases: [], messages: {}, seen: [], pool: [] };
+let data = { setup: null, aliases: [], messages: {}, seen: [], pool: [], rotation: {} };
 
 function loadData() {
   try {
@@ -66,6 +66,7 @@ function loadData() {
         data.messages = raw.messages && typeof raw.messages === 'object' ? raw.messages : {};
         data.seen = Array.isArray(raw.seen) ? raw.seen : [];
         data.pool = Array.isArray(raw.pool) ? raw.pool : [];
+        data.rotation = raw.rotation && typeof raw.rotation === 'object' ? raw.rotation : {};
       }
     }
   } catch (e) {
@@ -185,11 +186,60 @@ function poolFor(provider) {
   return (data.pool || []).filter((e) => e.provider === normProvider(provider));
 }
 
+// ---------- Auto-rotation: ek email par 3 naye temp mail, phir agli email ----------
+// Facebook IDs ke liye: ek base email par 3 IDs bante hain, phir list ki agli
+// email khud use hone lagti hai. Gin ti POST /api/alias (New Email) par hoti
+// hai — restore (purana code dobara kholna) gin ti me nahi aata. State
+// data.json me rehti hai (Render restart/deploy par reset ho sakti hai —
+// phir pehli email se dobara shuru hoti hai).
+const ROTATION_LIMIT = 3;
+
+function rotationState(provider) {
+  const p = normProvider(provider);
+  if (!data.rotation || typeof data.rotation !== 'object') data.rotation = {};
+  if (!data.rotation[p] || typeof data.rotation[p] !== 'object') data.rotation[p] = { index: 0, used: 0 };
+  return data.rotation[p];
+}
+
+// Admin panel + alias response ke liye: abhi kaun si email chal rahi hai,
+// us par kitne ban chuke, list me kitni bachi hain. Password kabhi nahi.
+function rotationStatus(provider) {
+  const p = normProvider(provider);
+  const entries = poolFor(p);
+  if (!entries.length) {
+    const s = effectiveSetup(p);
+    return { active: s ? s.baseEmail : null, used: 0, limit: ROTATION_LIMIT, remaining: 0, total: 0, poolEmpty: true };
+  }
+  const st = rotationState(p);
+  const idx = Math.max(0, Math.min(st.index, entries.length - 1));
+  st.index = idx;
+  const used = Math.max(0, Math.min(st.used, ROTATION_LIMIT));
+  return {
+    active: entries[idx].baseEmail,
+    used,
+    limit: ROTATION_LIMIT,
+    remaining: entries.length - 1 - idx,
+    total: entries.length,
+    poolEmpty: false,
+  };
+}
+
 function pickAccount(provider) {
   const p = normProvider(provider);
   const entries = poolFor(p);
   if (entries.length) {
-    const e = entries[Math.floor(Math.random() * entries.length)];
+    const st = rotationState(p);
+    // Index hamesha list ke andar rakho (entry delete hone par clamp).
+    if (st.index >= entries.length) { st.index = entries.length - 1; st.used = 0; }
+    if (st.index < 0) st.index = 0;
+    // 3 poore ho gaye aur agli email hai to rotate karo.
+    if (st.used >= ROTATION_LIMIT && st.index < entries.length - 1) {
+      st.index += 1;
+      st.used = 0;
+    }
+    const e = entries[st.index];
+    st.used += 1; // is email par ek aur naya temp mail ban gaya
+    saveData();
     return { baseEmail: e.baseEmail, appPassword: e.appPassword, poolId: e.id };
   }
   const s = effectiveSetup(p);
@@ -304,7 +354,7 @@ app.post('/api/alias', (req, res) => {
   const key = msgKey(provider, tag);
   if (!data.messages[key]) data.messages[key] = [];
   saveData();
-  res.json(publicAlias(alias));
+  res.json({ ...publicAlias(alias), rotation: rotationStatus(provider) });
 });
 
 // GET /api/alias/:code?provider=gmail -> alias dhoondo; na mile to code se dobara banao.
@@ -529,9 +579,9 @@ function publicPool() {
   return (data.pool || []).map((e) => ({ id: e.id, provider: e.provider, baseEmail: e.baseEmail, createdAt: e.createdAt }));
 }
 
-// GET /api/admin/pool -> list dikhao
+// GET /api/admin/pool -> list dikhao (rotation status ke saath)
 app.get('/api/admin/pool', requireAdmin, (req, res) => {
-  res.json({ pool: publicPool() });
+  res.json({ pool: publicPool(), rotation: { yandex: rotationStatus('yandex'), gmail: rotationStatus('gmail') } });
 });
 
 // POST /api/admin/pool {provider, baseEmail, appPassword} -> list me add karo
@@ -553,15 +603,25 @@ app.post('/api/admin/pool', requireAdmin, (req, res) => {
     data.pool.push({ id: crypto.randomBytes(6).toString('hex'), provider, baseEmail, appPassword, createdAt: new Date().toISOString() });
   }
   saveData();
-  res.json({ ok: true, pool: publicPool() });
+  res.json({ ok: true, pool: publicPool(), rotation: { yandex: rotationStatus('yandex'), gmail: rotationStatus('gmail') } });
 });
 
 // DELETE /api/admin/pool/:id -> list se hatao
 app.delete('/api/admin/pool/:id', requireAdmin, (req, res) => {
   const id = String(req.params.id || '');
-  data.pool = (data.pool || []).filter((e) => e.id !== id);
+  const list = data.pool || [];
+  const idx = list.findIndex((e) => e.id === id);
+  if (idx >= 0) {
+    // Rotation adjust karo: current entry delete hui to us ki gin ti reset;
+    // us se pehle wali delete hui to index ek peeche.
+    const st = rotationState(list[idx].provider);
+    if (idx < st.index) st.index -= 1;
+    else if (idx === st.index) st.used = 0;
+    if (st.index < 0) st.index = 0;
+  }
+  data.pool = list.filter((e) => e.id !== id);
   saveData();
-  res.json({ ok: true, pool: publicPool() });
+  res.json({ ok: true, pool: publicPool(), rotation: { yandex: rotationStatus('yandex'), gmail: rotationStatus('gmail') } });
 });
 
 // 404 for unknown API routes
