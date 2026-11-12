@@ -218,7 +218,6 @@
   function updateNotifyBtn() {
     var b = el("notify-btn");
     if (!b) return;
-    b.hidden = !notifySupported();
     b.textContent = S.notifyOn ? "🔔 On ✓" : "🔔 Notify me";
   }
   function renderNotifyLog() {
@@ -253,7 +252,7 @@
     logNotification(m);
   }
   function enableNotifications() {
-    if (!notifySupported()) return;
+    if (!notifySupported()) { S.notifyOn = true; saveNotifyPref(true); updateNotifyBtn(); renderNotifyLog(); return; }
     if (Notification.permission === "granted") {
       S.notifyOn = true; saveNotifyPref(true); updateNotifyBtn();
       try { new Notification("🔔 Notifications on", { body: "New mail will alert you here." }); } catch (e) {}
@@ -347,8 +346,8 @@
         '<h2>🔐 Admin Login</h2>' +
         '<p class="small dim" style="margin:.25rem 0 0">Sirf owner login kar sakta hai. Apna Yandex ya Gmail <strong>app password</strong> dalo (wohi jo setup me save hai).</p>' +
         '<form id="admin-login-form" style="margin-top:.75rem">' +
-        '<label class="field-label" for="admin-password">App password</label>' +
-        '<input id="admin-password" class="text-input mono-input field-input" type="password" placeholder="App password" autocomplete="off" />' +
+        '<label class="field-label" for="admin-password">Admin password</label>' +
+        '<input id="admin-password" class="text-input mono-input field-input" type="password" placeholder="Admin password" autocomplete="off" />' +
         '<button type="submit" class="save-btn" id="admin-login-btn">Login</button>' +
         '<p class="small error-text" id="admin-login-error" style="margin:.5rem 0 0" hidden></p></form></section>';
       el("admin-login-form").addEventListener("submit", function (ev) {
