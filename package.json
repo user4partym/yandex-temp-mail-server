@@ -1,0 +1,1 @@
+{"dependencies":{"cors":"^2.8.5","express":"^4.19.2","imapflow":"^1.0.157","mailparser":"^3.7.1"},"description":"Backend for Yandex Temp Mail Inbox — ek Yandex account se +tag temp emails, IMAP se inbox parh kar har tag ko us ki mail dikhata hai.","engines":{"node":">=18"},"main":"server.js","name":"yandex-temp-mail-server","scripts":{"start":"node server.js"},"version":"1.0.0"}
