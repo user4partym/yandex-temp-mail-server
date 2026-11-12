@@ -94,11 +94,16 @@ const GMAIL_ENV_SETUP = (process.env.GMAIL_BASE_EMAIL && process.env.GMAIL_APP_P
 
 function effectiveSetup(provider) {
   const p = normProvider(provider);
+  // Admin panel (data.setup) PEHLE — panel se badli hui email foran laagu ho.
+  // Env vars sirf fallback hain (pehli setup / panel change na hone par).
+  // Pehle env pehle tha, is liye panel "Setup saved ✓" dikhata tha par email
+  // badalti nahi thi — yehi bug tha.
   if (p === 'gmail') {
-    if (GMAIL_ENV_SETUP) return GMAIL_ENV_SETUP;
     if (data.setup && data.setup.gmail) return data.setup.gmail;
+    if (GMAIL_ENV_SETUP) return GMAIL_ENV_SETUP;
     return null;
   }
+  if (data.setup && data.setup.yandex) return data.setup.yandex;
   if (ENV_SETUP) return ENV_SETUP;
   if (data.setup && data.setup.yandex) return data.setup.yandex;
   // Purana single-setup format (sirf Yandex): { baseEmail, appPassword }
@@ -128,10 +133,10 @@ function isConfigured(provider) {
 }
 
 // ---------- Admin login + email pool ----------
-// Admin login = Yandex ya Gmail ka app password (jo setup me save hai).
-// Koi alag admin password file/code me nahi — sirf wohi login kar sakta hai
-// jis ke paas app password hai. Login par random token milta hai (sirf
-// server memory me rehta hai; restart par logout ho jata hai).
+// Admin login = Yandex ya Gmail ka app password (jo setup me save hai),
+// ya Render env ADMIN_PASSWORD (dedicated admin password).
+// Login par random token milta hai (sirf server memory me rehta hai;
+// restart par logout ho jata hai).
 const adminTokens = new Set();
 let loginFailCount = 0;
 let loginLockUntil = 0;
@@ -146,6 +151,11 @@ function adminPasswordMatches(pw) {
   if (adminPw && crypto.timingSafeEqual(h, hashPw(adminPw))) return true;
   for (const p of ['yandex', 'gmail']) {
     const s = effectiveSetup(p);
+    if (s && s.appPassword && crypto.timingSafeEqual(h, hashPw(s.appPassword))) return true;
+  }
+  // Env wale purane app passwords bhi login karwate hain — panel se email/
+  // password badalne ke baad bhi lockout na ho (purana password bhi chalega).
+  for (const s of [ENV_SETUP, GMAIL_ENV_SETUP]) {
     if (s && s.appPassword && crypto.timingSafeEqual(h, hashPw(s.appPassword))) return true;
   }
   return false;
